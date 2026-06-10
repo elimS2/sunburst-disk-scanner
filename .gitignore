@@ -6,3 +6,5 @@ env/
 
 # Generated scan reports — never commit
 *.html
+*.tier2.json
+*.tier3.json

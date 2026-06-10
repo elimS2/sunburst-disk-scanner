@@ -24,6 +24,8 @@ SMOKE_REPORT = PROJECT_DIR / "_smoke_report.html"
 TIER1_DEPTH = 5  # levels 1-5 from scan root — parsed on page load
 TIER2_DEPTH = 5  # levels 6-10 — parsed in idle time after first paint
 # Level 11+ — parsed on first drill into a deferred folder.
+# Embed all tiers in one HTML below this size; larger scans use sidecar JSON files.
+EMBED_ALL_LIMIT_BYTES = 5 * 1024 * 1024
 
 
 Node = dict[str, Any]
@@ -91,7 +93,24 @@ def make_error_node(path: Path, node_type: str, exc: BaseException) -> Node:
     return make_node(path=path, node_type=node_type, error=error_text(exc))
 
 
-def scan_entry(entry: os.DirEntry[str]) -> Node:
+def should_skip_as_link(entry: os.DirEntry[str], stat_result: os.stat_result) -> bool:
+    """Skip symlinks and non-directory reparse points (junction dirs are scanned)."""
+    if entry.is_symlink():
+        return True
+    if is_reparse_point(stat_result) and not statmod.S_ISDIR(stat_result.st_mode):
+        return True
+    return False
+
+
+def directory_identity(stat_result: os.stat_result) -> tuple[int, int]:
+    return (int(stat_result.st_dev), int(stat_result.st_ino))
+
+
+def scan_entry(
+    entry: os.DirEntry[str],
+    *,
+    _visited: set[tuple[int, int]] | None = None,
+) -> Node:
     path = Path(entry.path)
     try:
         stat_result = entry.stat(follow_symlinks=False)
@@ -102,12 +121,12 @@ def scan_entry(entry: os.DirEntry[str]) -> Node:
     except OSError as exc:
         return make_error_node(path, "error", exc)
 
-    if entry.is_symlink() or is_reparse_point(stat_result):
+    if should_skip_as_link(entry, stat_result):
         return make_node(path=path, node_type="link", size=stat_result.st_size)
 
     mode = stat_result.st_mode
     if statmod.S_ISDIR(mode):
-        return scan_directory(path)
+        return scan_directory(path, _visited=_visited)
     if statmod.S_ISREG(mode):
         return make_node(path=path, node_type="file", size=stat_result.st_size)
     return make_node(path=path, node_type="other", size=stat_result.st_size)
@@ -117,14 +136,34 @@ def sort_children(children: list[Node]) -> list[Node]:
     return sorted(children, key=lambda node: (-int(node["size"]), node["name"].lower()))
 
 
-def scan_directory(path: Path) -> Node:
+def scan_directory(
+    path: Path,
+    *,
+    _visited: set[tuple[int, int]] | None = None,
+) -> Node:
     children: list[Node] = []
     scan_error: str | None = None
+    visited = _visited if _visited is not None else set()
+
+    try:
+        stat_result = path.stat(follow_symlinks=False)
+        if statmod.S_ISDIR(stat_result.st_mode):
+            directory_key = directory_identity(stat_result)
+            if directory_key in visited:
+                return make_node(
+                    path=path,
+                    node_type="directory",
+                    size=0,
+                    error="Directory cycle skipped",
+                )
+            visited.add(directory_key)
+    except OSError as exc:
+        return make_error_node(path, "error", exc)
 
     try:
         with os.scandir(path) as entries:
             for entry in entries:
-                children.append(scan_entry(entry))
+                children.append(scan_entry(entry, _visited=visited))
     except FileNotFoundError as exc:
         return make_error_node(path, "missing", exc)
     except PermissionError as exc:
@@ -153,7 +192,9 @@ def scan_path(path: Path) -> Node:
     except OSError as exc:
         return make_error_node(path, "error", exc)
 
-    if path.is_symlink() or is_reparse_point(stat_result):
+    if path.is_symlink():
+        return make_node(path=path, node_type="link", size=stat_result.st_size)
+    if is_reparse_point(stat_result) and not statmod.S_ISDIR(stat_result.st_mode):
         return make_node(path=path, node_type="link", size=stat_result.st_size)
 
     mode = stat_result.st_mode
@@ -257,20 +298,27 @@ def json_payload_for_html(data: Any) -> str:
     )
 
 
-def report_html(data: Node) -> str:
-    tier1, tier2_tree, tier3_map = prepare_tiered_payload(data)
-    meta_payload = json_payload_for_html(
-        {
-            "tier1_depth": TIER1_DEPTH,
-            "tier2_depth": TIER2_DEPTH,
-            "tier3_paths": len(tier3_map),
-            "root_size": data["size_human"],
-        }
+def write_json_file(path: Path, data: Any) -> None:
+    """Write compact JSON to a sidecar tier file."""
+    path.write_text(
+        json.dumps(data, ensure_ascii=False, separators=(",", ":")),
+        encoding="utf-8",
     )
+
+
+def report_html(
+    tier1: Node,
+    *,
+    tier2_tree: Node,
+    tier3_map: dict[str, Node],
+    meta: dict[str, Any],
+    external_tiers: bool,
+) -> str:
+    meta_payload = json_payload_for_html(meta)
     tier1_payload = json_payload_for_html(tier1)
-    tier2_payload = json_payload_for_html(tier2_tree)
-    tier3_payload = json_payload_for_html(tier3_map)
-    title = html.escape(f"Disk Scan Report - {data['name']}")
+    tier2_payload = "{}" if external_tiers else json_payload_for_html(tier2_tree)
+    tier3_payload = "{}" if external_tiers else json_payload_for_html(tier3_map)
+    title = html.escape(f"Disk Scan Report - {tier1['name']}")
     template = """<!doctype html>
 <html lang="en">
 <head>
@@ -291,15 +339,16 @@ def report_html(data: Node) -> str:
     }
     body {
       margin: 0;
-      padding: 2rem;
+      padding: clamp(0.75rem, 2vw, 2rem);
       font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
       color: var(--text);
       background: var(--bg);
     }
     main {
-      max-width: 1180px;
+      width: min(1680px, 100%);
+      max-width: 96vw;
       margin: 0 auto;
-      padding: 1.5rem;
+      padding: clamp(1rem, 2vw, 1.75rem);
       background: var(--card);
       border: 1px solid var(--border);
       border-radius: 12px;
@@ -331,6 +380,13 @@ def report_html(data: Node) -> str:
       background: #f1f5f9;
       cursor: not-allowed;
     }
+    button.btn-secondary {
+      color: var(--accent);
+      background: #ffffff;
+    }
+    button.btn-secondary:hover:not(:disabled), button.btn-secondary:focus-visible:not(:disabled) {
+      background: #eff6ff;
+    }
     .muted {
       color: var(--muted);
     }
@@ -352,8 +408,8 @@ def report_html(data: Node) -> str:
     }
     .layout {
       display: grid;
-      grid-template-columns: minmax(320px, 720px) minmax(260px, 1fr);
-      gap: 1.5rem;
+      grid-template-columns: minmax(0, 1.55fr) minmax(280px, 0.85fr);
+      gap: clamp(1rem, 2vw, 1.75rem);
       align-items: start;
     }
     .chart-card, .details-card {
@@ -363,14 +419,44 @@ def report_html(data: Node) -> str:
     }
     .chart-card {
       position: relative;
-      padding: 1rem;
+      padding: 0.75rem;
+      display: flex;
+      flex-direction: column;
+      min-height: min(78vh, 920px);
+    }
+    .chart-toolbar {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.5rem;
+      align-items: center;
+      margin-bottom: 0.65rem;
+    }
+    .chart-toolbar .zoom-label {
+      min-width: 3.5rem;
+      text-align: center;
+      color: var(--muted);
+      font-size: 0.9rem;
+      font-variant-numeric: tabular-nums;
+    }
+    .chart-viewport {
+      flex: 1 1 auto;
+      min-height: min(68vh, 820px);
+      overflow: hidden;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      background: linear-gradient(180deg, #fafafa 0%, #ffffff 100%);
+      touch-action: none;
+      cursor: grab;
+    }
+    .chart-viewport.is-panning {
+      cursor: grabbing;
     }
     #sunburst {
       display: block;
       width: 100%;
-      height: auto;
-      max-width: 720px;
-      margin: 0 auto;
+      height: 100%;
+      min-height: min(68vh, 820px);
+      margin: 0;
     }
     .segment {
       stroke: #ffffff;
@@ -392,19 +478,23 @@ def report_html(data: Node) -> str:
       fill: #ffffff;
       stroke: #cbd5e1;
       stroke-width: 2;
+      pointer-events: none;
     }
     .center-title {
       font-size: 17px;
       font-weight: 700;
       fill: var(--text);
+      pointer-events: none;
     }
     .center-meta {
       font-size: 13px;
       fill: var(--muted);
+      pointer-events: none;
     }
     .empty-note {
       fill: var(--muted);
       font-size: 15px;
+      pointer-events: none;
     }
     .details-card {
       padding: 1rem;
@@ -481,9 +571,21 @@ def report_html(data: Node) -> str:
       }
       main {
         padding: 1rem;
+        max-width: 100%;
       }
       .layout {
         grid-template-columns: 1fr;
+      }
+      .chart-card {
+        min-height: min(62vh, 640px);
+      }
+      .chart-viewport, #sunburst {
+        min-height: min(52vh, 560px);
+      }
+    }
+    @media (min-width: 1400px) {
+      .layout {
+        grid-template-columns: minmax(0, 1.85fr) minmax(320px, 0.75fr);
       }
     }
   </style>
@@ -500,7 +602,15 @@ def report_html(data: Node) -> str:
     </div>
     <div class="layout">
       <section class="chart-card" aria-label="Sunburst disk usage chart">
-        <svg id="sunburst" viewBox="0 0 720 720" role="img" aria-labelledby="chart-title chart-desc"></svg>
+        <div class="chart-toolbar" aria-label="Chart zoom controls">
+          <button id="zoom-out-button" type="button" class="btn-secondary" title="Zoom out">−</button>
+          <span id="zoom-label" class="zoom-label">Fit</span>
+          <button id="zoom-in-button" type="button" class="btn-secondary" title="Zoom in">+</button>
+          <button id="zoom-fit-button" type="button" class="btn-secondary" title="Fit chart to view">Fit</button>
+        </div>
+        <div id="chart-viewport" class="chart-viewport">
+          <svg id="sunburst" viewBox="0 0 720 720" preserveAspectRatio="xMidYMid meet" role="img" aria-labelledby="chart-title chart-desc"></svg>
+        </div>
         <div id="tooltip" class="tooltip" role="status" hidden></div>
       </section>
       <aside class="details-card" aria-label="Selected node details">
@@ -524,6 +634,11 @@ def report_html(data: Node) -> str:
     const meta = JSON.parse(document.getElementById("scan-meta").textContent);
     const data = JSON.parse(document.getElementById("scan-tier-1").textContent);
     const svg = document.getElementById("sunburst");
+    const chartViewport = document.getElementById("chart-viewport");
+    const zoomLabel = document.getElementById("zoom-label");
+    const zoomInButton = document.getElementById("zoom-in-button");
+    const zoomOutButton = document.getElementById("zoom-out-button");
+    const zoomFitButton = document.getElementById("zoom-fit-button");
     const tooltip = document.getElementById("tooltip");
     const details = document.getElementById("selected-details");
     const childrenList = document.getElementById("children-list");
@@ -553,6 +668,66 @@ def report_html(data: Node) -> str:
     ];
     let currentNode = data;
     let history = [];
+    let chartContent = null;
+    let fitViewBox = { x: 0, y: 0, w: SIZE, h: SIZE };
+    let viewBoxState = { x: 0, y: 0, w: SIZE, h: SIZE };
+    const ZOOM_MIN = 0.15;
+    const ZOOM_MAX = 8;
+    let isPanning = false;
+    let panStart = null;
+    let panArmed = false;
+    const PAN_DRAG_THRESHOLD_PX = 4;
+
+    function applyViewBox() {
+      svg.setAttribute(
+        "viewBox",
+        `${viewBoxState.x} ${viewBoxState.y} ${viewBoxState.w} ${viewBoxState.h}`
+      );
+      const scale = SIZE / viewBoxState.w;
+      zoomLabel.textContent = `${Math.round(scale * 100)}%`;
+    }
+
+    function clientToSvg(clientX, clientY) {
+      const point = svg.createSVGPoint();
+      point.x = clientX;
+      point.y = clientY;
+      const matrix = svg.getScreenCTM();
+      if (!matrix) {
+        return { x: CENTER, y: CENTER };
+      }
+      return point.matrixTransform(matrix.inverse());
+    }
+
+    function zoomViewBox(factor, anchorX, anchorY) {
+      const anchor = clientToSvg(anchorX, anchorY);
+      const nextW = Math.min(Math.max(viewBoxState.w / factor, SIZE / ZOOM_MAX), SIZE / ZOOM_MIN);
+      const nextH = Math.min(Math.max(viewBoxState.h / factor, SIZE / ZOOM_MAX), SIZE / ZOOM_MIN);
+      const widthRatio = nextW / viewBoxState.w;
+      const heightRatio = nextH / viewBoxState.h;
+      viewBoxState = {
+        x: anchor.x - (anchor.x - viewBoxState.x) * widthRatio,
+        y: anchor.y - (anchor.y - viewBoxState.y) * heightRatio,
+        w: nextW,
+        h: nextH,
+      };
+      applyViewBox();
+    }
+
+    function fitChartToView() {
+      if (!chartContent) {
+        return;
+      }
+      const box = chartContent.getBBox();
+      const margin = Math.max(box.width, box.height) * 0.08;
+      fitViewBox = {
+        x: box.x - margin,
+        y: box.y - margin,
+        w: box.width + margin * 2,
+        h: box.height + margin * 2,
+      };
+      viewBoxState = { ...fitViewBox };
+      applyViewBox();
+    }
 
     function updateLoadStatus() {
       const tier2Label = tier2Loaded ? "loaded" : "pending";
@@ -578,65 +753,80 @@ def report_html(data: Node) -> str:
 
     function loadTier2() {
       if (tier2Loaded) {
-        return;
+        return Promise.resolve();
       }
-      tier2Tree = parseTierScript("scan-tier-2");
-      if (tier2Tree && tier2Tree.path === data.path) {
-        patchDeferredFromTree(data, tier2Tree);
-      }
-      tier2Loaded = true;
-      updateLoadStatus();
-    }
-
-    function findInTree(node, path) {
-      if (node.path === path) {
-        return node;
-      }
-      for (const child of childrenOf(node)) {
-        const found = findInTree(child, path);
-        if (found) {
-          return found;
+      const finish = (tree) => {
+        tier2Tree = tree;
+        if (tier2Tree && tier2Tree.path === data.path) {
+          tier2Index = indexTree(tier2Tree);
+          patchDeferredFromTree(data, tier2Index);
         }
+        tier2Loaded = true;
+        updateLoadStatus();
+      };
+      if (meta.tier2_file) {
+        return fetch(meta.tier2_file)
+          .then((response) => response.json())
+          .then(finish)
+          .catch((error) => {
+            console.warn("Tier 2 load failed", error);
+            tier2Loaded = true;
+            updateLoadStatus();
+          });
       }
-      return null;
+      finish(parseTierScript("scan-tier-2"));
+      return Promise.resolve();
     }
 
-    function patchDeferredFromTree(target, source) {
+    function indexTree(node, map = new Map()) {
+      map.set(node.path, node);
+      for (const child of childrenOf(node)) {
+        indexTree(child, map);
+      }
+      return map;
+    }
+
+    let tier2Index = null;
+
+    function patchDeferredFromTree(target, index) {
       if (target.deferred) {
-        const sourceNode = findInTree(source, target.path);
+        const sourceNode = index.get(target.path);
         if (sourceNode) {
           mergeExpansion(target, sourceNode);
         }
       }
       for (const child of childrenOf(target)) {
-        patchDeferredFromTree(child, source);
+        patchDeferredFromTree(child, index);
       }
     }
 
     function loadTier3() {
       if (tier3Loaded) {
-        return;
+        return Promise.resolve();
       }
-      tier3Map = parseTierScript("scan-tier-3");
-      tier3Loaded = true;
-      updateLoadStatus();
+      const finish = (map) => {
+        tier3Map = map;
+        tier3Loaded = true;
+        updateLoadStatus();
+      };
+      if (meta.tier3_file) {
+        return fetch(meta.tier3_file)
+          .then((response) => response.json())
+          .then(finish)
+          .catch((error) => {
+            console.warn("Tier 3 load failed", error);
+            tier3Loaded = true;
+            updateLoadStatus();
+          });
+      }
+      finish(parseTierScript("scan-tier-3"));
+      return Promise.resolve();
     }
 
     function scheduleTierLoading() {
       const idle = window.requestIdleCallback || ((callback) => setTimeout(callback, 120));
       idle(() => {
-        try {
-          loadTier2();
-        } catch (error) {
-          console.warn("Tier 2 load failed", error);
-        }
-        idle(() => {
-          try {
-            loadTier3();
-          } catch (error) {
-            console.warn("Tier 3 load failed", error);
-          }
-        });
+        loadTier2().then(() => loadTier3());
       });
     }
 
@@ -651,21 +841,19 @@ def report_html(data: Node) -> str:
 
     function resolveDeferred(node) {
       if (!node.deferred) {
-        return;
+        return Promise.resolve();
       }
-      if (!tier2Loaded) {
-        loadTier2();
-      }
-      if (!node.deferred) {
-        return;
-      }
-      if (!tier3Loaded) {
-        loadTier3();
-      }
-      if (tier3Map && tier3Map[node.path]) {
-        mergeExpansion(node, tier3Map[node.path]);
-        delete node.deferred;
-      }
+      return loadTier2().then(() => {
+        if (!node.deferred) {
+          return;
+        }
+        return loadTier3().then(() => {
+          if (tier3Map && tier3Map[node.path]) {
+            mergeExpansion(node, tier3Map[node.path]);
+            delete node.deferred;
+          }
+        });
+      });
     }
 
     function childrenOf(node) {
@@ -833,13 +1021,14 @@ def report_html(data: Node) -> str:
     }
 
     function drillInto(node) {
-      resolveDeferred(node);
-      if (!isFolder(node)) {
-        return;
-      }
-      history.push(currentNode);
-      currentNode = node;
-      render();
+      resolveDeferred(node).then(() => {
+        if (!isFolder(node)) {
+          return;
+        }
+        history.push(currentNode);
+        currentNode = node;
+        render();
+      });
     }
 
     function drawSegments(parent, startAngle, endAngle, depth) {
@@ -875,7 +1064,7 @@ def report_html(data: Node) -> str:
             }
           });
         }
-        svg.appendChild(path);
+        chartContent.appendChild(path);
         drawSegments(node, segment.start, segment.end, depth + 1);
       });
     }
@@ -927,15 +1116,15 @@ def report_html(data: Node) -> str:
     }
 
     function renderCenter() {
-      svg.appendChild(makeSvgElement("circle", {
+      chartContent.appendChild(makeSvgElement("circle", {
         cx: CENTER,
         cy: CENTER,
         r: CENTER_RADIUS - 8,
         class: "center-disc"
       }));
-      addText(svg, currentNode.name, CENTER, CENTER - 14, "center-title", 24);
-      addText(svg, currentNode.size_human, CENTER, CENTER + 10, "center-meta", 28);
-      addText(svg, currentNode.type, CENTER, CENTER + 32, "center-meta", 28);
+      addText(chartContent, currentNode.name, CENTER, CENTER - 14, "center-title", 24);
+      addText(chartContent, currentNode.size_human, CENTER, CENTER + 10, "center-meta", 28);
+      addText(chartContent, currentNode.type, CENTER, CENTER + 32, "center-meta", 28);
     }
 
     function renderEmptyState() {
@@ -949,7 +1138,7 @@ def report_html(data: Node) -> str:
         emptyState.textContent = "";
       }
       if (!children.length) {
-        addText(svg, "No child entries", CENTER, CENTER + CENTER_RADIUS + 42, "empty-note", 40);
+        addText(chartContent, "No child entries", CENTER, CENTER + CENTER_RADIUS + 42, "empty-note", 40);
       }
     }
 
@@ -958,15 +1147,18 @@ def report_html(data: Node) -> str:
       svg.appendChild(makeSvgElement("title", { id: "chart-title" })).textContent = "Sunburst disk usage";
       svg.appendChild(makeSvgElement("desc", { id: "chart-desc" })).textContent =
         "Circular sunburst diagram with sector angles proportional to file and folder sizes.";
+      chartContent = makeSvgElement("g", { id: "chart-content" });
       drawSegments(currentNode, 0, TAU, 0);
       renderCenter();
       renderEmptyState();
+      svg.appendChild(chartContent);
       renderDetails();
 
       const trail = pathParts(data, currentNode) || [currentNode];
       breadcrumb.textContent = trail.map((node) => node.name).join(" / ");
       backButton.disabled = history.length === 0;
       rootButton.disabled = currentNode === data;
+      requestAnimationFrame(fitChartToView);
     }
 
     backButton.addEventListener("click", () => {
@@ -980,6 +1172,77 @@ def report_html(data: Node) -> str:
       currentNode = data;
       history = [];
       render();
+    });
+    zoomInButton.addEventListener("click", () => {
+      const rect = chartViewport.getBoundingClientRect();
+      zoomViewBox(1.2, rect.left + rect.width / 2, rect.top + rect.height / 2);
+    });
+    zoomOutButton.addEventListener("click", () => {
+      const rect = chartViewport.getBoundingClientRect();
+      zoomViewBox(1 / 1.2, rect.left + rect.width / 2, rect.top + rect.height / 2);
+    });
+    zoomFitButton.addEventListener("click", fitChartToView);
+    chartViewport.addEventListener("wheel", (event) => {
+      event.preventDefault();
+      const factor = event.deltaY < 0 ? 1.12 : 1 / 1.12;
+      zoomViewBox(factor, event.clientX, event.clientY);
+    }, { passive: false });
+    chartViewport.addEventListener("pointerdown", (event) => {
+      if (event.button !== 0) {
+        return;
+      }
+      if (event.target.closest(".segment")) {
+        return;
+      }
+      panArmed = true;
+      panStart = {
+        x: event.clientX,
+        y: event.clientY,
+        view: { ...viewBoxState },
+      };
+    });
+    chartViewport.addEventListener("pointermove", (event) => {
+      if (!panArmed || !panStart) {
+        return;
+      }
+      const deltaX = event.clientX - panStart.x;
+      const deltaY = event.clientY - panStart.y;
+      if (!isPanning) {
+        if (Math.hypot(deltaX, deltaY) < PAN_DRAG_THRESHOLD_PX) {
+          return;
+        }
+        isPanning = true;
+        chartViewport.classList.add("is-panning");
+        chartViewport.setPointerCapture(event.pointerId);
+      }
+      const rect = svg.getBoundingClientRect();
+      const dx = (deltaX / rect.width) * panStart.view.w;
+      const dy = (deltaY / rect.height) * panStart.view.h;
+      viewBoxState = {
+        x: panStart.view.x - dx,
+        y: panStart.view.y - dy,
+        w: panStart.view.w,
+        h: panStart.view.h,
+      };
+      applyViewBox();
+    });
+    function stopPanning(event) {
+      panArmed = false;
+      if (!isPanning) {
+        panStart = null;
+        return;
+      }
+      isPanning = false;
+      panStart = null;
+      chartViewport.classList.remove("is-panning");
+      if (event && chartViewport.hasPointerCapture(event.pointerId)) {
+        chartViewport.releasePointerCapture(event.pointerId);
+      }
+    }
+    chartViewport.addEventListener("pointerup", stopPanning);
+    chartViewport.addEventListener("pointercancel", stopPanning);
+    window.addEventListener("resize", () => {
+      requestAnimationFrame(fitChartToView);
     });
     window.addEventListener("scroll", hideTooltip, { passive: true });
 
@@ -1009,14 +1272,45 @@ def dated_output_path(output_path: Path) -> Path:
 def write_report(data: Node, output_path: Path) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     started = time.perf_counter()
-    html_text = report_html(data)
+    tier1, tier2_tree, tier3_map = prepare_tiered_payload(data)
+    tier1_bytes = len(json.dumps(tier1, ensure_ascii=False, separators=(",", ":")))
+    tier2_bytes = len(json.dumps(tier2_tree, ensure_ascii=False, separators=(",", ":")))
+    tier3_bytes = len(json.dumps(tier3_map, ensure_ascii=False, separators=(",", ":")))
+    external_tiers = (tier1_bytes + tier2_bytes + tier3_bytes) > EMBED_ALL_LIMIT_BYTES
+    meta: dict[str, Any] = {
+        "tier1_depth": TIER1_DEPTH,
+        "tier2_depth": TIER2_DEPTH,
+        "tier3_paths": len(tier3_map),
+        "root_size": data["size_human"],
+        "tier2_file": None,
+        "tier3_file": None,
+        "external_tiers": external_tiers,
+    }
+    if external_tiers:
+        tier2_path = output_path.with_name(f"{output_path.stem}.tier2.json")
+        tier3_path = output_path.with_name(f"{output_path.stem}.tier3.json")
+        write_json_file(tier2_path, tier2_tree)
+        write_json_file(tier3_path, tier3_map)
+        meta["tier2_file"] = tier2_path.name
+        meta["tier3_file"] = tier3_path.name
+    html_text = report_html(
+        tier1,
+        tier2_tree=tier2_tree,
+        tier3_map=tier3_map,
+        meta=meta,
+        external_tiers=external_tiers,
+    )
     built = time.perf_counter()
     output_path.write_text(html_text, encoding="utf-8")
     written = time.perf_counter()
+    parts = [f"html: {human_size(output_path.stat().st_size)}"]
+    if external_tiers:
+        parts.append(f"tier2: {human_size(tier2_path.stat().st_size)}")
+        parts.append(f"tier3: {human_size(tier3_path.stat().st_size)}")
     print(
         f"Report build: {built - started:.1f}s, "
         f"write: {written - built:.1f}s, "
-        f"size: {human_size(output_path.stat().st_size)}",
+        f"{', '.join(parts)}",
         file=sys.stderr,
     )
 
