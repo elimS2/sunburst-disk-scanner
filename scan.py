@@ -552,6 +552,18 @@ def report_html(
     .tooltip div + div {
       margin-top: 0.2rem;
     }
+    .protocol-warning {
+      margin: 0 0 1rem;
+      padding: 0.75rem 1rem;
+      border: 1px solid #f59e0b;
+      border-radius: 8px;
+      background: #fffbeb;
+      color: #92400e;
+    }
+    #load-status.is-failed {
+      color: #b45309;
+      font-weight: 600;
+    }
     .tooltip-label {
       color: var(--muted);
     }
@@ -653,6 +665,8 @@ def report_html(
     let tier3Map = null;
     let tier2Loaded = false;
     let tier3Loaded = false;
+    let tier2LoadFailed = false;
+    let tier3LoadFailed = false;
 
     const SVG_NS = "http://www.w3.org/2000/svg";
     const SIZE = 720;
@@ -730,9 +744,14 @@ def report_html(
     }
 
     function updateLoadStatus() {
-      const tier2Label = tier2Loaded ? "loaded" : "pending";
-      const tier3Label = tier3Loaded ? "loaded" : (meta.tier3_paths ? "pending" : "n/a");
+      const tier2Label = tier2LoadFailed
+        ? "failed"
+        : (tier2Loaded ? "loaded" : "pending");
+      const tier3Label = tier3LoadFailed
+        ? "failed"
+        : (tier3Loaded ? "loaded" : (meta.tier3_paths ? "pending" : "n/a"));
       loadStatus.textContent = `Tiers: 1-5 ready | 6-10: ${tier2Label} | 11+: ${tier3Label}`;
+      loadStatus.classList.toggle("is-failed", tier2LoadFailed || tier3LoadFailed);
       jsonView.textContent = [
         `Root size: ${meta.root_size}`,
         `Tier 1 depth: levels 1-${meta.tier1_depth}`,
@@ -740,7 +759,56 @@ def report_html(
         `Tier 3 branches: ${meta.tier3_paths}`,
         `Tier 2 status: ${tier2Label}`,
         `Tier 3 status: ${tier3Label}`,
-      ].join("\\n");
+        meta.external_tiers && location.protocol === "file:"
+          ? "Warning: external tier files cannot load from file://. Use a local HTTP server."
+          : "",
+      ].filter(Boolean).join("\\n");
+    }
+
+    function showProtocolWarning() {
+      if (!meta.external_tiers || location.protocol !== "file:") {
+        return;
+      }
+      const banner = document.createElement("div");
+      banner.className = "protocol-warning";
+      banner.setAttribute("role", "alert");
+      banner.textContent =
+        "This large report loads .tier2.json and .tier3.json via fetch(). " +
+        "Opening the HTML file directly (file://) will not work. " +
+        "Run a local HTTP server in the report folder, e.g. python -m http.server 8766, " +
+        "then open http://127.0.0.1:8766/<report>.html";
+      document.querySelector("main").insertBefore(
+        banner,
+        document.querySelector("main > p.muted")
+      );
+    }
+
+    function expandFromTier2Index(node) {
+      if (!node || !node.deferred || !tier2Index) {
+        return false;
+      }
+      const sourceNode = tier2Index.get(node.path);
+      if (!sourceNode) {
+        return false;
+      }
+      mergeExpansion(node, sourceNode);
+      return true;
+    }
+
+    function refreshActiveDeferredNode() {
+      if (!currentNode || !currentNode.deferred) {
+        return false;
+      }
+      let changed = expandFromTier2Index(currentNode);
+      if (currentNode.deferred && tier3Map && tier3Map[currentNode.path]) {
+        mergeExpansion(currentNode, tier3Map[currentNode.path]);
+        delete currentNode.deferred;
+        changed = true;
+      }
+      if (changed && !currentNode.deferred) {
+        render();
+      }
+      return changed;
     }
 
     function parseTierScript(id) {
@@ -760,16 +828,23 @@ def report_html(
         if (tier2Tree && tier2Tree.path === data.path) {
           tier2Index = indexTree(tier2Tree);
           patchDeferredFromTree(data, tier2Index);
+          refreshActiveDeferredNode();
         }
         tier2Loaded = true;
         updateLoadStatus();
       };
       if (meta.tier2_file) {
         return fetch(meta.tier2_file)
-          .then((response) => response.json())
+          .then((response) => {
+            if (!response.ok) {
+              throw new Error(`HTTP ${response.status}`);
+            }
+            return response.json();
+          })
           .then(finish)
           .catch((error) => {
             console.warn("Tier 2 load failed", error);
+            tier2LoadFailed = true;
             tier2Loaded = true;
             updateLoadStatus();
           });
@@ -807,14 +882,21 @@ def report_html(
       const finish = (map) => {
         tier3Map = map;
         tier3Loaded = true;
+        refreshActiveDeferredNode();
         updateLoadStatus();
       };
       if (meta.tier3_file) {
         return fetch(meta.tier3_file)
-          .then((response) => response.json())
+          .then((response) => {
+            if (!response.ok) {
+              throw new Error(`HTTP ${response.status}`);
+            }
+            return response.json();
+          })
           .then(finish)
           .catch((error) => {
             console.warn("Tier 3 load failed", error);
+            tier3LoadFailed = true;
             tier3Loaded = true;
             updateLoadStatus();
           });
@@ -844,6 +926,7 @@ def report_html(
         return Promise.resolve();
       }
       return loadTier2().then(() => {
+        expandFromTier2Index(node);
         if (!node.deferred) {
           return;
         }
@@ -851,7 +934,9 @@ def report_html(
           if (tier3Map && tier3Map[node.path]) {
             mergeExpansion(node, tier3Map[node.path]);
             delete node.deferred;
+            return;
           }
+          expandFromTier2Index(node);
         });
       });
     }
@@ -1247,6 +1332,7 @@ def report_html(
     window.addEventListener("scroll", hideTooltip, { passive: true });
 
     updateLoadStatus();
+    showProtocolWarning();
     render();
     scheduleTierLoading();
   </script>
