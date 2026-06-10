@@ -7,6 +7,7 @@ import argparse
 import html
 import json
 import os
+import re
 import stat as statmod
 import sys
 import tempfile
@@ -24,8 +25,9 @@ SMOKE_REPORT = PROJECT_DIR / "_smoke_report.html"
 TIER1_DEPTH = 5  # levels 1-5 from scan root — parsed on page load
 TIER2_DEPTH = 5  # levels 6-10 — parsed in idle time after first paint
 # Level 11+ — parsed on first drill into a deferred folder.
-# Embed all tiers in one HTML below this size; larger scans use sidecar JSON files.
-EMBED_ALL_LIMIT_BYTES = 5 * 1024 * 1024
+# By default all tiers are embedded in one HTML file (works with file://).
+# Pass --external-tiers to write smaller HTML plus sidecar .tier2/.tier3 JSON
+# (requires a local HTTP server when viewing).
 
 
 Node = dict[str, Any]
@@ -605,7 +607,7 @@ def report_html(
 <body>
   <main>
     <h1>Disk Scan Report</h1>
-    <p class="muted">Self-contained local SVG sunburst report. Folder sectors can be clicked to drill in. Large scans load depth tiers progressively.</p>
+    <p class="muted">Self-contained local SVG sunburst report. Open the HTML directly in a browser (file://). Folder sectors can be clicked to drill in. Large scans load depth tiers progressively inside the page.</p>
     <div class="toolbar" aria-label="Navigation controls">
       <button id="back-button" type="button">Back</button>
       <button id="root-button" type="button">Root</button>
@@ -1355,19 +1357,53 @@ def dated_output_path(output_path: Path) -> Path:
     return output_path.with_name(f"{output_path.stem}_{stamp}{suffix}")
 
 
-def write_report(data: Node, output_path: Path) -> None:
+def read_report_tiers(html_path: Path) -> tuple[Node, Node, dict[str, Node], dict[str, Any]]:
+    """Load tier payloads from an existing report HTML and optional sidecar files."""
+    text = html_path.read_text(encoding="utf-8")
+
+    def extract_script(script_id: str) -> Any:
+        match = re.search(
+            rf'id="{script_id}" type="application/json">(.*?)</script>',
+            text,
+            re.S,
+        )
+        if not match or not match.group(1).strip():
+            return {}
+        return json.loads(match.group(1))
+
+    meta = extract_script("scan-meta")
+    tier1 = extract_script("scan-tier-1")
+    tier2_tree = extract_script("scan-tier-2")
+    tier3_map = extract_script("scan-tier-3")
+    sidecar_dir = html_path.parent
+
+    tier2_file = meta.get("tier2_file")
+    if tier2_file and not tier2_tree:
+        tier2_tree = json.loads((sidecar_dir / tier2_file).read_text(encoding="utf-8"))
+
+    tier3_file = meta.get("tier3_file")
+    if tier3_file and not tier3_map:
+        tier3_map = json.loads((sidecar_dir / tier3_file).read_text(encoding="utf-8"))
+
+    return tier1, tier2_tree, tier3_map, meta
+
+
+def emit_report(
+    output_path: Path,
+    tier1: Node,
+    tier2_tree: Node,
+    tier3_map: dict[str, Node],
+    root_size: str,
+    *,
+    external_tiers: bool,
+) -> None:
+    """Write HTML report, optionally using sidecar JSON for tiers 2 and 3."""
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    started = time.perf_counter()
-    tier1, tier2_tree, tier3_map = prepare_tiered_payload(data)
-    tier1_bytes = len(json.dumps(tier1, ensure_ascii=False, separators=(",", ":")))
-    tier2_bytes = len(json.dumps(tier2_tree, ensure_ascii=False, separators=(",", ":")))
-    tier3_bytes = len(json.dumps(tier3_map, ensure_ascii=False, separators=(",", ":")))
-    external_tiers = (tier1_bytes + tier2_bytes + tier3_bytes) > EMBED_ALL_LIMIT_BYTES
     meta: dict[str, Any] = {
         "tier1_depth": TIER1_DEPTH,
         "tier2_depth": TIER2_DEPTH,
         "tier3_paths": len(tier3_map),
-        "root_size": data["size_human"],
+        "root_size": root_size,
         "tier2_file": None,
         "tier3_file": None,
         "external_tiers": external_tiers,
@@ -1386,17 +1422,57 @@ def write_report(data: Node, output_path: Path) -> None:
         meta=meta,
         external_tiers=external_tiers,
     )
-    built = time.perf_counter()
     output_path.write_text(html_text, encoding="utf-8")
+
+
+def write_report(data: Node, output_path: Path, *, external_tiers: bool = False) -> None:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    started = time.perf_counter()
+    tier1, tier2_tree, tier3_map = prepare_tiered_payload(data)
+    built = time.perf_counter()
+    emit_report(
+        output_path,
+        tier1,
+        tier2_tree,
+        tier3_map,
+        str(data["size_human"]),
+        external_tiers=external_tiers,
+    )
     written = time.perf_counter()
     parts = [f"html: {human_size(output_path.stat().st_size)}"]
     if external_tiers:
+        tier2_path = output_path.with_name(f"{output_path.stem}.tier2.json")
+        tier3_path = output_path.with_name(f"{output_path.stem}.tier3.json")
         parts.append(f"tier2: {human_size(tier2_path.stat().st_size)}")
         parts.append(f"tier3: {human_size(tier3_path.stat().st_size)}")
+    mode = "external sidecars" if external_tiers else "self-contained"
     print(
         f"Report build: {built - started:.1f}s, "
         f"write: {written - built:.1f}s, "
-        f"{', '.join(parts)}",
+        f"{mode}, {', '.join(parts)}",
+        file=sys.stderr,
+    )
+
+
+def rebuild_report_from_file(html_path: Path, *, external_tiers: bool = False) -> None:
+    """Rebuild an existing report, e.g. convert sidecar tiers into one HTML file."""
+    started = time.perf_counter()
+    tier1, tier2_tree, tier3_map, meta = read_report_tiers(html_path)
+    loaded = time.perf_counter()
+    emit_report(
+        html_path,
+        tier1,
+        tier2_tree,
+        tier3_map,
+        str(meta.get("root_size") or tier1.get("size_human") or ""),
+        external_tiers=external_tiers,
+    )
+    written = time.perf_counter()
+    mode = "external sidecars" if external_tiers else "self-contained"
+    print(
+        f"Rebuild read: {loaded - started:.1f}s, "
+        f"write: {written - loaded:.1f}s, "
+        f"{mode}, html: {human_size(html_path.stat().st_size)}",
         file=sys.stderr,
     )
 
@@ -1508,6 +1584,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help=f"Run a self-check and write {SMOKE_REPORT.name} in the project directory.",
     )
+    parser.add_argument(
+        "--external-tiers",
+        action="store_true",
+        help=(
+            "Write tier 2/3 as sidecar .json files next to the HTML (smaller HTML, "
+            "but opening via file:// will not load deeper levels)."
+        ),
+    )
+    parser.add_argument(
+        "--rehtml",
+        metavar="REPORT.html",
+        help="Rebuild an existing report HTML (optionally embed sidecar tiers for file://).",
+    )
     return parser.parse_args(argv)
 
 
@@ -1521,6 +1610,19 @@ def main(argv: list[str] | None = None) -> int:
             print(f"Smoke failed: {error_text(exc)}", file=sys.stderr)
             return 1
         print(f"Smoke passed: {report_path}")
+        return 0
+
+    if args.rehtml:
+        html_path = Path(args.rehtml)
+        if not html_path.is_file():
+            print(f"Report not found: {html_path}", file=sys.stderr)
+            return 1
+        try:
+            rebuild_report_from_file(html_path, external_tiers=args.external_tiers)
+        except OSError as exc:
+            print(f"Could not rebuild report: {error_text(exc)}", file=sys.stderr)
+            return 1
+        print(f"Report: {safe_path_string(html_path)}")
         return 0
 
     target = Path(args.path)
@@ -1538,7 +1640,7 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     try:
-        write_report(data, output_path)
+        write_report(data, output_path, external_tiers=args.external_tiers)
     except OSError as exc:
         print(f"Could not write report: {error_text(exc)}", file=sys.stderr)
         return 1

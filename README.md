@@ -40,11 +40,15 @@ Empty or zero-size folders are valid input. The report shows an empty state when
 
 ## Report Contents
 
-Generated reports are static and self-contained:
+Generated reports are static and self-contained by default:
 
 - No CDN or external assets.
-- Embedded JSON scan data.
+- Embedded JSON scan data (all depth tiers inside the HTML for large scans).
 - Embedded vanilla JavaScript and CSS.
-- Tooltips include name, human-readable size, full path, type, and error details when present.
+- Open reports directly in a browser with `file://` — no local HTTP server required.
+- Optional `--external-tiers` writes smaller HTML plus sidecar `.tier2.json` / `.tier3.json`
+  files (requires a local HTTP server when viewing).
+
+Tooltips include name, human-readable size, full path, type, and error details when present.
 
 Privacy note: reports embed scanned names, sizes, and full local paths. Review the HTML before sharing it outside your machine.
