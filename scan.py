@@ -10,6 +10,7 @@ import os
 import stat as statmod
 import sys
 import tempfile
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -18,6 +19,11 @@ from typing import Any
 PROJECT_DIR = Path(__file__).resolve().parent
 DEFAULT_REPORT = PROJECT_DIR / "disk_report.html"
 SMOKE_REPORT = PROJECT_DIR / "_smoke_report.html"
+
+# Progressive browser loading: one full scan, three embedded JSON depth tiers.
+TIER1_DEPTH = 5  # levels 1-5 from scan root — parsed on page load
+TIER2_DEPTH = 5  # levels 6-10 — parsed in idle time after first paint
+# Level 11+ — parsed on first drill into a deferred folder.
 
 
 Node = dict[str, Any]
@@ -158,7 +164,90 @@ def scan_path(path: Path) -> Node:
     return make_node(path=path, node_type="other", size=stat_result.st_size)
 
 
-def json_payload_for_html(data: Node) -> str:
+def limit_depth(node: Node, max_depth: int, depth: int = 0) -> Node:
+    """Return a copy of *node* with children truncated at *max_depth* (0-based depth)."""
+    children = list(node.get("children") or [])
+    result: Node = {
+        "name": node["name"],
+        "path": node["path"],
+        "type": node["type"],
+        "size": node["size"],
+        "size_human": node["size_human"],
+        "children": [],
+    }
+    if node.get("error"):
+        result["error"] = node["error"]
+
+    if node.get("type") != "directory" or not children:
+        return result
+
+    if depth >= max_depth:
+        if children:
+            result["deferred"] = True
+        return result
+
+    result["children"] = [
+        limit_depth(child, max_depth, depth + 1) for child in children
+    ]
+    return result
+
+
+def index_nodes_by_path(root: Node) -> dict[str, Node]:
+    """Build a path -> node lookup in a single tree walk."""
+    index: dict[str, Node] = {str(root["path"]): root}
+
+    def walk(node: Node) -> None:
+        for child in node.get("children") or []:
+            index[str(child["path"])] = child
+            walk(child)
+
+    walk(root)
+    return index
+
+
+def collect_deferred_paths(node: Node) -> list[str]:
+    """Collect paths of folder nodes that still have unloaded deeper children."""
+    paths: list[str] = []
+    if node.get("deferred"):
+        paths.append(str(node["path"]))
+    for child in node.get("children") or []:
+        paths.extend(collect_deferred_paths(child))
+    return paths
+
+
+def expansion_slice(node: Node) -> Node:
+    """Minimal node payload used when merging a deeper tier."""
+    return {
+        "name": node["name"],
+        "path": node["path"],
+        "type": node["type"],
+        "size": node["size"],
+        "size_human": node["size_human"],
+        "children": list(node.get("children") or []),
+    }
+
+
+def prepare_tiered_payload(
+    full: Node,
+    *,
+    tier1_depth: int = TIER1_DEPTH,
+    tier2_depth: int = TIER2_DEPTH,
+) -> tuple[Node, Node, dict[str, Node]]:
+    """Split a full scan tree into three progressively loaded depth tiers."""
+    tier1 = limit_depth(full, tier1_depth, 0)
+    tier2_tree = limit_depth(full, tier1_depth + tier2_depth, 0)
+    path_index = index_nodes_by_path(full)
+    tier3_map: dict[str, Node] = {}
+
+    for path in collect_deferred_paths(tier2_tree):
+        node = path_index.get(path)
+        if node is not None:
+            tier3_map[path] = expansion_slice(node)
+
+    return tier1, tier2_tree, tier3_map
+
+
+def json_payload_for_html(data: Any) -> str:
     """Serialize JSON so it is safe inside an HTML script tag."""
     payload = json.dumps(data, ensure_ascii=False, separators=(",", ":"))
     return (
@@ -169,7 +258,18 @@ def json_payload_for_html(data: Node) -> str:
 
 
 def report_html(data: Node) -> str:
-    safe_payload = json_payload_for_html(data)
+    tier1, tier2_tree, tier3_map = prepare_tiered_payload(data)
+    meta_payload = json_payload_for_html(
+        {
+            "tier1_depth": TIER1_DEPTH,
+            "tier2_depth": TIER2_DEPTH,
+            "tier3_paths": len(tier3_map),
+            "root_size": data["size_human"],
+        }
+    )
+    tier1_payload = json_payload_for_html(tier1)
+    tier2_payload = json_payload_for_html(tier2_tree)
+    tier3_payload = json_payload_for_html(tier3_map)
     title = html.escape(f"Disk Scan Report - {data['name']}")
     template = """<!doctype html>
 <html lang="en">
@@ -285,6 +385,9 @@ def report_html(data: Node) -> str:
     .segment.folder {
       cursor: pointer;
     }
+    .segment.deferred {
+      stroke-dasharray: 4 3;
+    }
     .center-disc {
       fill: #ffffff;
       stroke: #cbd5e1;
@@ -388,11 +491,12 @@ def report_html(data: Node) -> str:
 <body>
   <main>
     <h1>Disk Scan Report</h1>
-    <p class="muted">Self-contained local SVG sunburst report. Folder sectors can be clicked to drill in.</p>
+    <p class="muted">Self-contained local SVG sunburst report. Folder sectors can be clicked to drill in. Large scans load depth tiers progressively.</p>
     <div class="toolbar" aria-label="Navigation controls">
       <button id="back-button" type="button">Back</button>
       <button id="root-button" type="button">Root</button>
       <span id="breadcrumb" class="breadcrumb"></span>
+      <span id="load-status" class="breadcrumb"></span>
     </div>
     <div class="layout">
       <section class="chart-card" aria-label="Sunburst disk usage chart">
@@ -408,22 +512,32 @@ def report_html(data: Node) -> str:
       </aside>
     </div>
     <details>
-      <summary>Embedded JSON data</summary>
+      <summary>Load status</summary>
       <pre id="json-view"></pre>
     </details>
   </main>
-  <script id="scan-data" type="application/json">__PAYLOAD__</script>
+  <script id="scan-meta" type="application/json">__META__</script>
+  <script id="scan-tier-1" type="application/json">__TIER1__</script>
+  <script id="scan-tier-2" type="application/json">__TIER2__</script>
+  <script id="scan-tier-3" type="application/json">__TIER3__</script>
   <script>
-    const data = JSON.parse(document.getElementById("scan-data").textContent);
+    const meta = JSON.parse(document.getElementById("scan-meta").textContent);
+    const data = JSON.parse(document.getElementById("scan-tier-1").textContent);
     const svg = document.getElementById("sunburst");
     const tooltip = document.getElementById("tooltip");
     const details = document.getElementById("selected-details");
     const childrenList = document.getElementById("children-list");
     const emptyState = document.getElementById("empty-state");
     const breadcrumb = document.getElementById("breadcrumb");
+    const loadStatus = document.getElementById("load-status");
     const backButton = document.getElementById("back-button");
     const rootButton = document.getElementById("root-button");
-    document.getElementById("json-view").textContent = JSON.stringify(data, null, 2);
+    const jsonView = document.getElementById("json-view");
+
+    let tier2Tree = null;
+    let tier3Map = null;
+    let tier2Loaded = false;
+    let tier3Loaded = false;
 
     const SVG_NS = "http://www.w3.org/2000/svg";
     const SIZE = 720;
@@ -432,13 +546,127 @@ def report_html(data: Node) -> str:
     const CENTER_RADIUS = 74;
     const RING_WIDTH = 68;
     const RING_GAP = 1.4;
-    const MAX_DEPTH = 3;
+    const MAX_DEPTH = 5;
     const PALETTE = [
       "#2563eb", "#16a34a", "#ea580c", "#9333ea", "#0891b2", "#dc2626",
       "#4f46e5", "#65a30d", "#d97706", "#be123c", "#0d9488", "#7c3aed"
     ];
     let currentNode = data;
     let history = [];
+
+    function updateLoadStatus() {
+      const tier2Label = tier2Loaded ? "loaded" : "pending";
+      const tier3Label = tier3Loaded ? "loaded" : (meta.tier3_paths ? "pending" : "n/a");
+      loadStatus.textContent = `Tiers: 1-5 ready | 6-10: ${tier2Label} | 11+: ${tier3Label}`;
+      jsonView.textContent = [
+        `Root size: ${meta.root_size}`,
+        `Tier 1 depth: levels 1-${meta.tier1_depth}`,
+        `Tier 2 depth: levels 6-${meta.tier1_depth + meta.tier2_depth}`,
+        `Tier 3 branches: ${meta.tier3_paths}`,
+        `Tier 2 status: ${tier2Label}`,
+        `Tier 3 status: ${tier3Label}`,
+      ].join("\\n");
+    }
+
+    function parseTierScript(id) {
+      const element = document.getElementById(id);
+      if (!element || !element.textContent.trim()) {
+        return {};
+      }
+      return JSON.parse(element.textContent);
+    }
+
+    function loadTier2() {
+      if (tier2Loaded) {
+        return;
+      }
+      tier2Tree = parseTierScript("scan-tier-2");
+      if (tier2Tree && tier2Tree.path === data.path) {
+        patchDeferredFromTree(data, tier2Tree);
+      }
+      tier2Loaded = true;
+      updateLoadStatus();
+    }
+
+    function findInTree(node, path) {
+      if (node.path === path) {
+        return node;
+      }
+      for (const child of childrenOf(node)) {
+        const found = findInTree(child, path);
+        if (found) {
+          return found;
+        }
+      }
+      return null;
+    }
+
+    function patchDeferredFromTree(target, source) {
+      if (target.deferred) {
+        const sourceNode = findInTree(source, target.path);
+        if (sourceNode) {
+          mergeExpansion(target, sourceNode);
+        }
+      }
+      for (const child of childrenOf(target)) {
+        patchDeferredFromTree(child, source);
+      }
+    }
+
+    function loadTier3() {
+      if (tier3Loaded) {
+        return;
+      }
+      tier3Map = parseTierScript("scan-tier-3");
+      tier3Loaded = true;
+      updateLoadStatus();
+    }
+
+    function scheduleTierLoading() {
+      const idle = window.requestIdleCallback || ((callback) => setTimeout(callback, 120));
+      idle(() => {
+        try {
+          loadTier2();
+        } catch (error) {
+          console.warn("Tier 2 load failed", error);
+        }
+        idle(() => {
+          try {
+            loadTier3();
+          } catch (error) {
+            console.warn("Tier 3 load failed", error);
+          }
+        });
+      });
+    }
+
+    function mergeExpansion(node, expansion) {
+      node.children = Array.isArray(expansion.children) ? expansion.children : [];
+      if (expansion.deferred) {
+        node.deferred = true;
+      } else {
+        delete node.deferred;
+      }
+    }
+
+    function resolveDeferred(node) {
+      if (!node.deferred) {
+        return;
+      }
+      if (!tier2Loaded) {
+        loadTier2();
+      }
+      if (!node.deferred) {
+        return;
+      }
+      if (!tier3Loaded) {
+        loadTier3();
+      }
+      if (tier3Map && tier3Map[node.path]) {
+        mergeExpansion(node, tier3Map[node.path]);
+        delete node.deferred;
+      }
+    }
 
     function childrenOf(node) {
       return Array.isArray(node.children) ? node.children : [];
@@ -449,7 +677,10 @@ def report_html(data: Node) -> str:
     }
 
     function isFolder(node) {
-      return node.type === "directory" && childrenOf(node).length > 0;
+      if (node.type !== "directory") {
+        return false;
+      }
+      return childrenOf(node).length > 0 || Boolean(node.deferred);
     }
 
     function nodeLabel(node) {
@@ -602,6 +833,7 @@ def report_html(data: Node) -> str:
     }
 
     function drillInto(node) {
+      resolveDeferred(node);
       if (!isFolder(node)) {
         return;
       }
@@ -624,7 +856,7 @@ def report_html(data: Node) -> str:
         const path = makeSvgElement("path", {
           d: arcPath(innerRadius, outerRadius, segment.start, segment.end),
           fill: colorFor(node, depth, index),
-          class: `segment ${isFolder(node) ? "folder" : ""}`,
+          class: `segment ${isFolder(node) ? "folder" : ""} ${node.deferred ? "deferred" : ""}`,
           role: isFolder(node) ? "button" : "img",
           tabindex: "0",
           "aria-label": nodeLabel(node)
@@ -670,6 +902,12 @@ def report_html(data: Node) -> str:
       }
 
       childrenList.replaceChildren();
+      if (currentNode.deferred) {
+        const pending = document.createElement("li");
+        pending.className = "muted";
+        pending.textContent = "Deeper entries load on drill-in (progressive tiers).";
+        childrenList.appendChild(pending);
+      }
       for (const child of childrenOf(currentNode)) {
         const item = document.createElement("li");
         const name = document.createElement("span");
@@ -745,12 +983,20 @@ def report_html(data: Node) -> str:
     });
     window.addEventListener("scroll", hideTooltip, { passive: true });
 
+    updateLoadStatus();
     render();
+    scheduleTierLoading();
   </script>
 </body>
 </html>
 """
-    return template.replace("__TITLE__", title).replace("__PAYLOAD__", safe_payload)
+    return (
+        template.replace("__TITLE__", title)
+        .replace("__META__", meta_payload)
+        .replace("__TIER1__", tier1_payload)
+        .replace("__TIER2__", tier2_payload)
+        .replace("__TIER3__", tier3_payload)
+    )
 
 
 def dated_output_path(output_path: Path) -> Path:
@@ -762,7 +1008,17 @@ def dated_output_path(output_path: Path) -> Path:
 
 def write_report(data: Node, output_path: Path) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.write_text(report_html(data), encoding="utf-8")
+    started = time.perf_counter()
+    html_text = report_html(data)
+    built = time.perf_counter()
+    output_path.write_text(html_text, encoding="utf-8")
+    written = time.perf_counter()
+    print(
+        f"Report build: {built - started:.1f}s, "
+        f"write: {written - built:.1f}s, "
+        f"size: {human_size(output_path.stat().st_size)}",
+        file=sys.stderr,
+    )
 
 
 def collect_names(node: Node) -> set[str]:
@@ -815,6 +1071,9 @@ def run_smoke() -> Path:
     missing_from_html = sorted(name for name in expected if name not in html_text)
     ui_markers = (
         "id=\"sunburst\"",
+        "id=\"scan-tier-1\"",
+        "id=\"scan-tier-2\"",
+        "id=\"scan-tier-3\"",
         "Back",
         "Root",
         "Sunburst disk usage",
@@ -823,6 +1082,7 @@ def run_smoke() -> Path:
         "addEventListener(\"click\"",
         "Path",
         "KB",
+        "scheduleTierLoading",
     )
     missing_ui = [marker for marker in ui_markers if marker not in html_text]
 
@@ -887,7 +1147,16 @@ def main(argv: list[str] | None = None) -> int:
     output_path = Path(args.output)
     if args.dated:
         output_path = dated_output_path(output_path)
+
+    scan_started = time.perf_counter()
     data = scan_path(target)
+    scan_finished = time.perf_counter()
+    print(
+        f"Scan finished in {scan_finished - scan_started:.1f}s "
+        f"({data['size_human']})",
+        file=sys.stderr,
+    )
+
     try:
         write_report(data, output_path)
     except OSError as exc:
